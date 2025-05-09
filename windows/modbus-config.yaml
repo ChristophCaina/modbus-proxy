@@ -1,0 +1,23 @@
+devices:
+- modbus:
+    url: 127.0.0.1:502
+  listen:
+    bind: 127.0.0.1:5020
+logging:
+  version: 1
+  formatters:
+    standard:
+      format: "%(asctime)s %(levelname)8s %(name)s: %(message)s"
+  handlers:
+    file:
+      class : logging.handlers.RotatingFileHandler
+      filename: logconfig.log
+      maxBytes: 102400
+      backupCount: 99
+      formatter: standard
+    console:
+      class: logging.StreamHandler
+      formatter: standard
+  root:
+    handlers: ['file', 'console']
+    level: DEBUG
