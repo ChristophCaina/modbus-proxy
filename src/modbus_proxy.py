@@ -179,7 +179,7 @@ class SunSpecConverter:
                     else:
                         continue
                 raw_int = _decode_int16(data, offset)
-                encoded = _encode_float32(raw_int * (10 ** sf))
+                encoded = _encode_float32(float(raw_int) * (10.0 ** sf))
                 data[offset:offset + 2] = encoded[0:2]
                 if start <= conv.sf_address < start + count:
                     data[(conv.sf_address - start) * 2:(conv.sf_address - start) * 2 + 2] = encoded[2:4]
