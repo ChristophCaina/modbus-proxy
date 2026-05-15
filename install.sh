@@ -12,7 +12,7 @@ python3 -m venv /opt/modbus-proxy
 /opt/modbus-proxy/bin/pip install --quiet pyyaml
 
 # Download proxy script
-curl -fsSL https://raw.githubusercontent.com/ChristophCaina/modbus-proxy/main/modbus_proxy.py \
+curl -fsSL https://raw.githubusercontent.com/ChristophCaina/modbus-proxy/format-changer/modbus_proxy.py \
     -o /opt/modbus-proxy/modbus_proxy.py
 
 # Create default config if not exists
