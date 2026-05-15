@@ -9,6 +9,7 @@
 import asyncio
 import pathlib
 import argparse
+import struct
 import warnings
 import contextlib
 import logging.config
@@ -39,6 +40,259 @@ def parse_url(url):
         url = result.geturl().replace("://", "://0")
         result = urlparse(url)
     return result
+
+
+# ---------------------------------------------------------------------------
+# SunSpec register conversion helpers
+# ---------------------------------------------------------------------------
+
+def _decode_int16(data, offset):
+    """Decode a signed 16-bit integer from Modbus register bytes."""
+    return struct.unpack_from(">h", data, offset)[0]
+
+
+def _encode_float32(value):
+    """Encode a float32 value as two Modbus registers (4 bytes, big-endian)."""
+    return struct.pack(">f", value)
+
+
+def _decode_float32(data, offset):
+    """Decode a float32 value from two Modbus registers (4 bytes, big-endian)."""
+    return struct.unpack_from(">f", data, offset)[0]
+
+
+def _encode_int16_sf(value):
+    """Encode a scaled float as int16 + scale factor register pair.
+
+    Finds the scale factor that preserves maximum precision while keeping
+    the int16 value within [-32768, 32767].
+    """
+    if value == 0:
+        return struct.pack(">hh", 0, 0)
+    # Try from most precise (sf=-10) to least precise (sf=0)
+    for sf in range(-10, 1):
+        scaled = round(value * (10 ** -sf))
+        if -32768 <= scaled <= 32767:
+            return struct.pack(">hh", int(scaled), sf)
+    # Fallback: clamp to int16 range with sf=0
+    scaled = max(-32767, min(32767, int(value)))
+    return struct.pack(">hh", scaled, 0)
+
+
+class RegisterConversion:
+    """
+    Describes a single SunSpec register conversion rule.
+
+    Supports:
+      int16+sf  → float32   (e.g. SolarEdge → Bosch Energy Manager)
+      float32   → int16+sf  (e.g. Fronius   → SolarEdge-compatible client)
+
+    Config example (YAML):
+
+      register_conversions:
+        - address: 40083        # I_AC_Power (base-1 Modbus address)
+          sf_address: 40084     # I_AC_Power_SF
+          source_type: int16    # what the real device sends
+          target_type: float32  # what this proxy should serve
+
+        - address: 40206        # M_AC_Power (meter)
+          sf_address: 40210
+          source_type: int16
+          target_type: float32
+    """
+
+    VALID_TYPES = {"int16", "float32"}
+
+    def __init__(self, address, source_type, target_type, sf_address=None):
+        if source_type not in self.VALID_TYPES:
+            raise ValueError(f"source_type must be one of {self.VALID_TYPES}")
+        if target_type not in self.VALID_TYPES:
+            raise ValueError(f"target_type must be one of {self.VALID_TYPES}")
+        if source_type == target_type:
+            raise ValueError("source_type and target_type must differ")
+        if source_type == "int16" and sf_address is None:
+            raise ValueError("sf_address is required when source_type is int16")
+
+        # Convert base-1 Modbus address to 0-based protocol offset
+        self.address = address - 1        # 0-based register index
+        self.sf_address = (sf_address - 1) if sf_address is not None else None
+        self.source_type = source_type
+        self.target_type = target_type
+
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(
+            address=cfg["address"],
+            source_type=cfg["source_type"],
+            target_type=cfg["target_type"],
+            sf_address=cfg.get("sf_address"),
+        )
+
+    def __repr__(self):
+        return (
+            f"RegisterConversion(address={self.address + 1}, "
+            f"{self.source_type}→{self.target_type})"
+        )
+
+
+class SunSpecConverter:
+    """
+    Applies RegisterConversion rules to Modbus TCP reply payloads.
+
+    The converter patches the register data in-place within the raw Modbus
+    TCP frame so that the downstream client receives the converted values.
+
+    Scale factor values are cached from previous replies so that conversions
+    can be applied even when the SF register is not included in the current
+    response window.
+    """
+
+    def __init__(self, conversions):
+        self.conversions = conversions
+        # Cache: {sf_register_0based: int16_sf_value}
+        self._sf_cache = {}
+
+    def _parse_read_response(self, reply):
+        """
+        Parse a Modbus TCP read holding registers response.
+
+        Returns (start_address_0based, register_count, data_bytes) or None
+        if the frame is not a valid read response (function code 0x03).
+        """
+        if len(reply) < 9:
+            return None
+        # Byte 7 = function code
+        func_code = reply[7]
+        if func_code != 0x03:
+            return None
+
+        # Byte 8 = byte count
+        byte_count = reply[8]
+        if len(reply) < 9 + byte_count:
+            return None
+
+        # Extract the register data bytes
+        data = bytearray(reply[9:9 + byte_count])
+        reg_count = byte_count // 2
+        return data, reg_count
+
+    def _parse_read_request(self, request):
+        """
+        Parse a Modbus TCP read holding registers request.
+
+        Returns (start_address_0based, register_count) or None.
+        """
+        if len(request) < 12:
+            return None
+        func_code = request[7]
+        if func_code != 0x03:
+            return None
+        start = int.from_bytes(request[8:10], "big")
+        count = int.from_bytes(request[10:12], "big")
+        return start, count
+
+    def update_sf_cache(self, request, reply):
+        """
+        After receiving a reply, cache any scale factor register values
+        that fall within the response window.
+        """
+        req = self._parse_read_request(request)
+        res = self._parse_read_response(reply)
+        if req is None or res is None:
+            return
+
+        start, count = req
+        data, _ = res
+
+        for conv in self.conversions:
+            if conv.sf_address is None:
+                continue
+            if start <= conv.sf_address < start + count:
+                offset = (conv.sf_address - start) * 2
+                sf_value = _decode_int16(data, offset)
+                self._sf_cache[conv.sf_address] = sf_value
+                log.debug(
+                    "Cached SF register %d = %d", conv.sf_address + 1, sf_value
+                )
+
+    def transform_reply(self, request, reply):
+        """
+        Apply conversions to a Modbus TCP reply.
+
+        Returns the (possibly modified) reply bytes.
+        """
+        req = self._parse_read_request(request)
+        res = self._parse_read_response(reply)
+        if req is None or res is None:
+            return reply
+
+        start, count = req
+        data, _ = res
+
+        modified = False
+        for conv in self.conversions:
+            if not (start <= conv.address < start + count):
+                continue  # register not in this response window
+
+            offset = (conv.address - start) * 2
+
+            if conv.source_type == "int16" and conv.target_type == "float32":
+                # int16 + SF → float32
+                # Value register must be in window; SF may come from cache
+                sf = self._sf_cache.get(conv.sf_address)
+                if sf is None:
+                    if start <= conv.sf_address < start + count:
+                        sf_offset = (conv.sf_address - start) * 2
+                        sf = _decode_int16(data, sf_offset)
+                        self._sf_cache[conv.sf_address] = sf
+                    else:
+                        log.debug(
+                            "SF register %d not in window and not cached, "
+                            "skipping conversion of register %d",
+                            conv.sf_address + 1, conv.address + 1,
+                        )
+                        continue
+
+                raw_int = _decode_int16(data, offset)
+                float_val = raw_int * (10 ** sf)
+                encoded = _encode_float32(float_val)
+
+                # float32 occupies 2 registers (4 bytes) — same as int16+SF
+                # We write the float into the value register slot and zero
+                # the SF register slot (SF=0 is neutral for any reader that
+                # still tries to apply it)
+                data[offset:offset + 2] = encoded[0:2]
+                if start <= conv.sf_address < start + count:
+                    sf_offset = (conv.sf_address - start) * 2
+                    data[sf_offset:sf_offset + 2] = encoded[2:4]
+
+                log.debug(
+                    "Converted register %d: int16(%d)*10^%d → float32(%.4f)",
+                    conv.address + 1, raw_int, sf, float_val,
+                )
+                modified = True
+
+            elif conv.source_type == "float32" and conv.target_type == "int16":
+                # float32 → int16 + SF
+                # float32 spans 2 registers; value reg + next reg
+                if offset + 4 > len(data):
+                    continue
+                float_val = _decode_float32(data, offset)
+                encoded = _encode_int16_sf(float_val)
+                data[offset:offset + 4] = encoded
+                log.debug(
+                    "Converted register %d: float32(%.4f) → int16+SF",
+                    conv.address + 1, float_val,
+                )
+                modified = True
+
+        if not modified:
+            return reply
+
+        # Rebuild the reply with the patched data
+        reply = bytearray(reply)
+        reply[9:9 + len(data)] = data
+        return bytes(reply)
 
 
 class Connection:
@@ -92,7 +346,6 @@ class Connection:
 
     async def _read(self):
         """Read ModBus TCP message"""
-        # TODO: Handle Modbus RTU and ASCII
         header = await self.reader.readexactly(6)
         size = int.from_bytes(header[4:], "big")
         reply = header + await self.reader.readexactly(size)
@@ -135,6 +388,16 @@ class ModBus(Connection):
         self.unit_id_remapping = config.get("unit_id_remapping") or {}
         self.server = None
         self.lock = asyncio.Lock()
+
+        # SunSpec register conversions (optional)
+        conversions_cfg = config.get("register_conversions") or []
+        conversions = [RegisterConversion.from_config(c) for c in conversions_cfg]
+        self.converter = SunSpecConverter(conversions) if conversions else None
+        if conversions:
+            log.info(
+                "SunSpec conversions enabled on port %d: %s",
+                self.port, conversions,
+            )
 
     @property
     def address(self):
@@ -181,7 +444,8 @@ class ModBus(Connection):
             self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
         return request
 
-    def _transform_reply(self, reply):
+    def _transform_reply(self, request, reply):
+        # Unit ID remapping (inverse)
         uid = reply[6]
         inverse_unit_id_map = {v: k for k, v in self.unit_id_remapping.items()}
         new_uid = inverse_unit_id_map.setdefault(uid, uid)
@@ -189,6 +453,13 @@ class ModBus(Connection):
             reply = bytearray(reply)
             reply[6] = new_uid
             self.log.debug("remapping unit ID %s to %s in reply", uid, new_uid)
+            reply = bytes(reply)
+
+        # SunSpec register conversion
+        if self.converter is not None:
+            self.converter.update_sf_cache(request, reply)
+            reply = self.converter.transform_reply(request, reply)
+
         return reply
 
     async def handle_client(self, reader, writer):
@@ -197,10 +468,11 @@ class ModBus(Connection):
                 request = await client.read()
                 if not request:
                     break
-                reply = await self.write_read(self._transform_request(request))
+                transformed_request = self._transform_request(request)
+                reply = await self.write_read(transformed_request)
                 if not reply:
                     break
-                result = await client.write(self._transform_reply(reply))
+                result = await client.write(self._transform_reply(request, reply))
                 if not result:
                     break
 
