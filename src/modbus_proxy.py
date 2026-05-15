@@ -455,7 +455,7 @@ class ModBus(Connection):
         await self.close()
 
     async def serve_forever(self):
-        await self.start()
+        # start() is called by run_bridges via start_bridges — don't call again
         coros = [listener.serve_forever() for listener in self.listeners]
         await asyncio.gather(*coros)
 
