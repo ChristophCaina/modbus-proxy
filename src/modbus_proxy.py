@@ -155,6 +155,50 @@ class SunSpecConverter:
                 offset = (conv.sf_address - start) * 2
                 self._sf_cache[conv.sf_address] = _decode_int16(data, offset)
 
+    async def warmup(self, write_read_func):
+        """
+        Read all configured scale factor registers at startup to populate
+        the cache before the first client request arrives.
+
+        This prevents the first poll from returning incorrect values when
+        the SF register is not included in the client's polling window.
+        """
+        sf_addresses = {
+            conv.sf_address
+            for conv in self.conversions
+            if conv.sf_address is not None
+        }
+        if not sf_addresses:
+            return
+
+        min_addr = min(sf_addresses)
+        max_addr = max(sf_addresses)
+        count = max_addr - min_addr + 1
+
+        # Build a minimal Modbus TCP read holding registers request
+        # Transaction ID: 1, Protocol: 0, Length: 6, Unit: 1, FC: 0x03
+        request = (
+            b"\x00\x01"  # transaction id
+            b"\x00\x00"  # protocol id
+            b"\x00\x06"  # length
+            b"\x01"      # unit id
+            b"\x03"      # function code: read holding registers
+            + min_addr.to_bytes(2, "big")
+            + count.to_bytes(2, "big")
+        )
+
+        reply = await write_read_func(request)
+        if reply is None:
+            log.warning("SF warmup read failed — cache will be populated on first poll")
+            return
+
+        self.update_sf_cache(request, reply)
+        log.info(
+            "SF warmup complete — cached %d scale factor register(s): %s",
+            len(sf_addresses),
+            [addr + 1 for addr in sorted(sf_addresses)],
+        )
+
     def transform_reply(self, request, reply):
         req = self._parse_read_request(request)
         res = self._parse_read_response(reply)
@@ -348,6 +392,8 @@ class Listener:
                     break
 
     async def start(self):
+        if self.converter is not None:
+            await self.converter.warmup(self.modbus.write_read)
         self.server = await asyncio.start_server(
             self.handle_client, self.host, self.port, start_serving=True
         )
