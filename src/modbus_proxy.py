@@ -186,10 +186,21 @@ class SunSpecConverter:
                 + sf_addr.to_bytes(2, "big")
                 + b"\x00\x01"  # count: 1 register
             )
-            reply = await write_read_func(request)
+            reply = None
+            for attempt in range(5):
+                reply = await write_read_func(request)
+                if reply is not None:
+                    break
+                log.info(
+                    "SF warmup retry %d/5 for register %d in 3s...",
+                    attempt + 1,
+                    sf_addr + 1,
+                )
+                await asyncio.sleep(3)
+
             if reply is None:
                 log.warning(
-                    "SF warmup read failed for register %d — "
+                    "SF warmup failed for register %d after 5 attempts — "
                     "cache will be populated on first poll",
                     sf_addr + 1,
                 )
