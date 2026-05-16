@@ -162,6 +162,9 @@ class SunSpecConverter:
 
         This prevents the first poll from returning incorrect values when
         the SF register is not included in the client's polling window.
+
+        Reads each SF register individually to avoid exceeding the Modbus
+        maximum of 125 registers per request.
         """
         sf_addresses = {
             conv.sf_address
@@ -171,33 +174,35 @@ class SunSpecConverter:
         if not sf_addresses:
             return
 
-        min_addr = min(sf_addresses)
-        max_addr = max(sf_addresses)
-        count = max_addr - min_addr + 1
+        cached = []
+        for sf_addr in sorted(sf_addresses):
+            # Build a single-register read request for each SF
+            request = (
+                b"\x00\x01"  # transaction id
+                b"\x00\x00"  # protocol id
+                b"\x00\x06"  # length
+                b"\x01"      # unit id
+                b"\x03"      # function code: read holding registers
+                + sf_addr.to_bytes(2, "big")
+                + b"\x00\x01"  # count: 1 register
+            )
+            reply = await write_read_func(request)
+            if reply is None:
+                log.warning(
+                    "SF warmup read failed for register %d — "
+                    "cache will be populated on first poll",
+                    sf_addr + 1,
+                )
+                continue
+            self.update_sf_cache(request, reply)
+            cached.append(sf_addr + 1)
 
-        # Build a minimal Modbus TCP read holding registers request
-        # Transaction ID: 1, Protocol: 0, Length: 6, Unit: 1, FC: 0x03
-        request = (
-            b"\x00\x01"  # transaction id
-            b"\x00\x00"  # protocol id
-            b"\x00\x06"  # length
-            b"\x01"      # unit id
-            b"\x03"      # function code: read holding registers
-            + min_addr.to_bytes(2, "big")
-            + count.to_bytes(2, "big")
-        )
-
-        reply = await write_read_func(request)
-        if reply is None:
-            log.warning("SF warmup read failed — cache will be populated on first poll")
-            return
-
-        self.update_sf_cache(request, reply)
-        log.info(
-            "SF warmup complete — cached %d scale factor register(s): %s",
-            len(sf_addresses),
-            [addr + 1 for addr in sorted(sf_addresses)],
-        )
+        if cached:
+            log.info(
+                "SF warmup complete — cached %d scale factor register(s): %s",
+                len(cached),
+                cached,
+            )
 
     def transform_reply(self, request, reply):
         req = self._parse_read_request(request)
