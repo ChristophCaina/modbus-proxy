@@ -307,8 +307,8 @@ class Listener:
 
     @property
     def address(self):
-        if self.server is not None:
-            return self.server.sockets[0].getsockname()
+        if self.listeners:
+            return self.listeners[0].address
 
     def _transform_request(self, request):
         uid = request[6]
