@@ -476,6 +476,12 @@ class ModBus(Connection):
                         unit_id_remapping=unit_id_remapping,
                     )
                 )
+    @property
+    def address(self):
+        """Return the address of the first listener (backwards compatibility)."""
+        if self.listeners and self.listeners[0].server is not None:
+            return self.listeners[0].server.sockets[0].getsockname()
+        return None
 
     async def open(self):
         self.log.info("connecting to modbus...")
